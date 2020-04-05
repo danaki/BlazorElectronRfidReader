@@ -1,0 +1,141 @@
+﻿@page "/"
+@using System.ComponentModel;
+@using PCSC;
+@using PCSC.Iso7816;
+@using PCSC.Exceptions;
+
+<h1>Blazor/Electron/RFID Card reader</h1>
+
+<p>Rfid availability: @rfidAvailability</p>
+<p>Card Id: @cardId</p>
+
+@implements IDisposable
+@code {
+    private BackgroundWorker backgroundWorker;
+    private bool rfidAvailability;
+    private string cardId;
+
+    public void Dispose()
+    {
+        backgroundWorker.Dispose();
+        backgroundWorker = null;
+    }
+
+    protected override void OnInitialized()
+    {
+        Console.WriteLine("Timer Started.");
+
+        backgroundWorker = new BackgroundWorker
+        {
+            WorkerSupportsCancellation = true,
+            WorkerReportsProgress = true
+        };
+
+        backgroundWorker.DoWork += new DoWorkEventHandler(ScanRfid);
+        backgroundWorker.ProgressChanged += ScanRfidCompleted;
+        backgroundWorker.RunWorkerAsync();
+
+        base.OnInitialized();
+    }
+
+    private void ScanRfid(object sender, DoWorkEventArgs e)
+    {
+        while (true)
+        {
+            try
+            {
+                var contextFactory = ContextFactory.Instance;
+                using (var context = contextFactory.Establish(SCardScope.System))
+                {
+                    var readerNames = context.GetReaders();
+
+                    if (readerNames != null && readerNames.Count() > 0)
+                    {
+                        rfidAvailability = true;
+
+                        var readerName = ChooseRfidReader(readerNames.ToList());
+
+                        try
+                        {
+                            using (var rfidReader = context.ConnectReader(readerName, SCardShareMode.Shared, SCardProtocol.Any))
+                            {
+                                var apdu = new CommandApdu(IsoCase.Case2Short, rfidReader.Protocol)
+                                {
+                                    CLA = 0xFF,
+                                    Instruction = InstructionCode.GetData,
+                                    P1 = 0x00,
+                                    P2 = 0x00,
+                                    Le = 0 // We don't know the ID tag size
+                                };
+
+                                using (rfidReader.Transaction(SCardReaderDisposition.Leave))
+                                {
+                                    var sendPci = SCardPCI.GetPci(rfidReader.Protocol);
+                                    var receivePci = new SCardPCI(); // IO returned protocol control information.
+
+                                    var receiveBuffer = new byte[256];
+                                    var command = apdu.ToArray();
+
+                                    var bytesReceived = rfidReader.Transmit(
+                                        sendPci, // Protocol Control Information (T0, T1 or Raw)
+                                        command, // command APDU
+                                        command.Length,
+                                        receivePci, // returning Protocol Control Information
+                                        receiveBuffer,
+                                        receiveBuffer.Length); // data buffer
+
+                                    var responseApdu =
+                                        new ResponseApdu(receiveBuffer, bytesReceived, IsoCase.Case2Short, rfidReader.Protocol);
+
+                                    if (responseApdu.HasData)
+                                    {
+                                        Console.WriteLine("SW1: {0:X2}, SW2: {1:X2} Uid: {2}",
+                                            responseApdu.SW1,
+                                            responseApdu.SW2,
+                                            BitConverter.ToString(responseApdu.GetData()));
+
+                                        backgroundWorker.ReportProgress(0, BitConverter.ToString(responseApdu.GetData()));
+                                    }
+                                }
+                            }
+                        }
+                        catch (RemovedCardException)
+                        {
+                            // Console.Write("Removed");
+                        }
+                    }
+                    else
+                    {
+                        rfidAvailability = false;
+                        cardId = "";
+                    }
+
+                    InvokeAsync(() =>
+                    {
+                        this.StateHasChanged();
+                    });
+                }
+            }
+            catch (PCSCException)
+            {
+            }
+
+            System.Threading.Thread.Sleep(100);
+        }
+    }
+
+    private static string ChooseRfidReader(IList<string> readerNames)
+    {
+        return readerNames[0];
+    }
+
+    private void ScanRfidCompleted(object sender, ProgressChangedEventArgs e)
+    {
+        cardId = (string)e.UserState;
+
+        InvokeAsync(() =>
+        {
+            this.StateHasChanged();
+        });
+    }
+}
